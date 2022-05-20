@@ -114,7 +114,7 @@ pub use common::{HTTPVersion, Header, HeaderField, Method, StatusCode};
 pub use connection::{ConfigListenAddr, ListenAddr, Listener};
 pub use request::{ReadWrite, Request};
 pub use response::{Response, ResponseBox};
-pub use websocket::{Websocket};
+pub use websocket::{Websocket, WebsocketFrame};
 pub use test::TestRequest;
 
 mod client;

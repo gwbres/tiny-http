@@ -2,7 +2,8 @@ use thiserror::Error;
 
 use base64;
 use sha1::Sha1;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::io::{Error, ErrorKind};
 
 use ascii::AsciiString;
 use crate::{Request, Header, Response, StatusCode, ReadWrite};
@@ -34,37 +35,87 @@ pub enum WebsocketError {
 	MissingProtocolField,
 }
 
-/// Websocket receiver state machine
-pub enum WebsocketState {
-	Opcode,
-	FrameLength,
-	Payload,
-}
-
 /// Websocket handler
 pub struct Websocket {
-	state: WebsocketState,
 	socket: Box<dyn ReadWrite + Send>,
 }
 
-/// Websocket Messages
-pub enum Message {
+const CONTINUATION_OPCODE 	: u8 = 0x00;
+const TEXT_OPCODE 			: u8 = 0x01;
+const BINARY_OPCODE			: u8 = 0x02;
+const CLOSE_OPCODE			: u8 = 0x08;
+const PING_OPCODE 			: u8 = 0x09;
+const PONG_OPCODE 			: u8 = 0x0A;
+
+/// Known Websocket frames 
+#[derive(Debug)]
+pub enum WebsocketFrame {
 	/// Text Message
 	Text(String),
 	/// Binary Data
 	Binary(Vec<u8>),
+	/// Close() request
+	CloseRequest,
+	/// Ping request
+	Ping,
+	/// Pong answer
+	Pong,
+}
+
+/// Websocket message 
+#[derive(Debug)]
+pub struct Message {
+	/// FIN bit 
+	pub fin: bool,
+	/// content 
+	pub frame: WebsocketFrame,
+}
+
+impl Default for WebsocketFrame {
+	fn default() -> WebsocketFrame { WebsocketFrame::Pong }
+}
+
+fn read_bigendian_u16<'a, T: Iterator<Item = &'a u8>>(input: &mut T) -> u16 {
+	let buf : [u8; 2] = [
+		*input.next().unwrap(), 
+		*input.next().unwrap()
+	];
+	u16::from_be_bytes(buf)
+}
+
+fn read_bigendian_u32<'a, T: Iterator<Item = &'a u8>>(input: &mut T) -> u32 {
+	let buf : [u8; 4] = [
+		*input.next().unwrap(), 
+		*input.next().unwrap(),
+		*input.next().unwrap(),
+		*input.next().unwrap(),
+	];
+	u32::from_be_bytes(buf)
+}
+
+fn read_bigendian_u64<'a, T: Iterator<Item = &'a u8>>(input: &mut T) -> u64 {
+	let buf : [u8; 8] = [
+		*input.next().unwrap(), 
+		*input.next().unwrap(),
+		*input.next().unwrap(),
+		*input.next().unwrap(),
+		*input.next().unwrap(), 
+		*input.next().unwrap(),
+		*input.next().unwrap(),
+		*input.next().unwrap(),
+	];
+	u64::from_be_bytes(buf)
 }
 
 impl Websocket {
-	/// Deploys a new websocket handler (reader + writer) ready to use,
-	/// from a valid HTTP(s) request. Given request should match
-	/// HTTP header prerequisites.
-	/// request: received HTTP request
-	/// protocol: optionnal (custom) protocol to declare
-	/// Returns Websocket handler if requirements are matched.
-	/// If Err() (unmatched requirements are returned) it is best pratice
-	/// to respond that request with 404 error
-	pub fn new (mut request: Request, protocol: Option<&str>) -> Result<Websocket, WebsocketError> {
+	/// Deploys a new websocket handler (Rd/Wr stream) ready to use,
+	/// from a valid HTTP(s) request. 
+	/// Given request should match HTTP header requirements (refer to Doc.).   
+	/// request: HTTP websocket openning request   
+	/// protocol: optionnal (custom) protocol to declare   
+	/// If Err() (unmet header requirements),
+	/// it is best pratice to respond with a 404 error
+	pub fn new (request: Request, protocol: Option<&str>) -> Result<Websocket, WebsocketError> {
 		if let Ok(true) = is_websocket_request(&request) {
 			let mut upgrade = Response::empty(StatusCode(101)) // `switching` protocol
 				.with_header(Header {
@@ -76,13 +127,13 @@ impl Websocket {
 				if let Some(protocols) = request_protocols(&request) {
 					upgrade
 						.add_header(Header{
-							field: "Websocket-Protocol".parse().unwrap(),
-							value: AsciiString::from_ascii(format!("{}, {}", protocols[0], protocol)).unwrap(), //TODO retrieve all previous protocols please
+							field: "Sec-Websocket-Protocol".parse().unwrap(),
+							value: AsciiString::from_ascii(format!("{}", protocol)).unwrap(), //TODO retrieve all previous protocols please
 						});
 				} else {
 					upgrade
 						.add_header(Header{
-							field: "Websocket-Protocol".parse().unwrap(),
+							field: "Sec-Websocket-Protocol".parse().unwrap(),
 							value: AsciiString::from_ascii(protocol).unwrap(),
 						});
 				}
@@ -96,12 +147,99 @@ impl Websocket {
 				});
 			let socket = request.upgrade("websocket", upgrade);
 			Ok(Websocket {
-				state: WebsocketState::Opcode,
 				socket: socket,
 			})
 		} else {
 			Err(WebsocketError::InvalidWebsocketRequest)
 		}
+	}
+	
+	/// Blocking websocket raw data receiver
+	pub fn recv (&mut self) -> std::io::Result<Message> {
+		let mut buf : Vec<u8> = Vec::with_capacity(256);
+		// 1) read at least 6 bytes 
+		//    otherwise, cant create a valid header
+		if self.socket.as_mut().take(6).read_to_end(&mut buf).is_err() {
+			// not enough bytes
+			return Err(Error::new(ErrorKind::UnexpectedEof, "not even 6 bytes to read()"));
+		}
+
+		// opcode
+		if buf[0] & 0x70 != 0 {
+			return Err(Error::new(ErrorKind::Other, "reserved bits (in opcode) must be zero"))
+		}
+		
+		let fin = (buf[0] & 0x80) != 0;
+		let opcode = buf[0] & 0x0F;
+		if buf[1] & 0x80 == 0 {
+			return Err(Error::new(ErrorKind::Other, "Client to server messages must be masked"))
+		}
+		
+		// find frame length & identify data mask
+		let (length, mask) = match buf[1] & 0x7F {
+			126 => {
+				println!("126!");
+				let length = read_bigendian_u16(&mut buf.iter().skip(2));
+				(length as u64, 0)
+			},
+			127 => {
+				println!("127!");
+				let length = read_bigendian_u16(&mut buf.iter().skip(2));
+				(length as u64, 0)
+			},
+			n => {
+				println!("{}!",n);
+				(u64::from(n),read_bigendian_u32(&mut buf.iter().skip(2)))
+			},
+		};
+		
+		println!("Size: {}", length);
+
+		// grab raw data if needed
+		let mut data : Option<Vec<u8>> = match opcode {
+			BINARY_OPCODE | TEXT_OPCODE => {
+				self.socket
+					.as_mut()
+					.take(length)
+					.read_to_end(&mut buf);
+				let mut data : Vec<u8> = Vec::with_capacity(length as usize);
+				let mut offset : usize = 0;
+				for i in 0..length as usize {
+					let m = ((mask >> ((3-offset)*8)) & 0xFF) as u8;
+					data.push(buf[i] ^ m);
+					offset = (offset +1) %4;
+				}
+				Some(data)
+			},
+			_ => None,
+		};
+		println!("RAW DATA {:#?}", data.as_ref().unwrap());
+
+		let frame = match opcode {
+			CONTINUATION_OPCODE => {
+				panic!("unable to handle continuation opcodes @ the moment")
+			},
+			BINARY_OPCODE => WebsocketFrame::Binary(data.unwrap()),
+			TEXT_OPCODE => { 
+				if let Ok(content) = std::str::from_utf8(&data.unwrap()) {
+					WebsocketFrame::Text(content.to_string())
+				} else {
+					panic!("text decoding failure")
+				}
+			},
+			CLOSE_OPCODE => WebsocketFrame::CloseRequest,
+			PING_OPCODE => WebsocketFrame::Ping,
+			PONG_OPCODE => {
+				panic!("received unexpected pong answer")
+			},
+			_ => {
+				panic!("received unknown opcode {}", opcode)
+			}
+		};
+		Ok(Message{
+			fin,
+			frame,
+		})
 	}
 }
 
