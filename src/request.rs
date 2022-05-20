@@ -303,7 +303,7 @@ impl Request {
     ///  is destroyed before continuing to read or write on the socket. Therefore you should always
     ///  destroy it as soon as possible.
     pub fn upgrade<R: Read>(
-        mut self,
+        &mut self,
         protocol: &str,
         response: Response<R>,
     ) -> Box<dyn ReadWrite + Send> {
