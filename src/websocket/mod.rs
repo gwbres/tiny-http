@@ -121,42 +121,38 @@ impl Websocket {
 	/// If Err() (unmet header requirements),
 	/// it is best pratice to respond with a 404 error
 	pub fn new (request: Request, protocol: Option<&str>) -> Result<Websocket, WebsocketError> {
-		if let Ok(true) = is_websocket_request(&request) {
-			let mut upgrade = Response::empty(StatusCode(101)) // `switching` protocol
-				.with_header(Header {
-					field: "Set-Cookie".parse().unwrap(),
-					value: AsciiString::from_ascii("SID=abcdefg; Max-Age=3600; Path=/; HttpOnly").unwrap(),
-				});
-			if let Some(protocol) = protocol {
-				// add possible desired custom protocol
-				if let Some(protocols) = request_protocols(&request) {
-					upgrade
-						.add_header(Header{
-							field: "Sec-Websocket-Protocol".parse().unwrap(),
-							value: AsciiString::from_ascii(format!("{}", protocol)).unwrap(), //TODO retrieve all previous protocols please
-						});
-				} else {
-					upgrade
-						.add_header(Header{
-							field: "Sec-Websocket-Protocol".parse().unwrap(),
-							value: AsciiString::from_ascii(protocol).unwrap(),
-						});
-				}
-			}
-			let key = request_key(&request)?; 
-			let key = convert_key(&key);
-			upgrade
-				.add_header(Header{
-					field: "Sec-Websocket-Accept".parse().unwrap(),
-					value: AsciiString::from_ascii(key).unwrap(),
-				});
-			let socket = request.upgrade("websocket", upgrade);
-			Ok(Websocket {
-				socket: socket,
-			})
-		} else {
-			Err(WebsocketError::InvalidWebsocketRequest)
-		}
+        let mut upgrade = Response::empty(StatusCode(101)) // `switching` protocol
+            .with_header(Header {
+                field: "Set-Cookie".parse().unwrap(),
+                value: AsciiString::from_ascii("SID=abcdefg; Max-Age=3600; Path=/; HttpOnly").unwrap(),
+            });
+        if let Some(protocol) = protocol {
+            // add possible desired custom protocol
+            if let Some(protocols) = request_protocols(&request) {
+                upgrade
+                    .add_header(Header{
+                        field: "Sec-Websocket-Protocol".parse().unwrap(),
+                        value: AsciiString::from_ascii(format!("{}", protocol)).unwrap(), //TODO retrieve all previous protocols please
+                    });
+            } else {
+                upgrade
+                    .add_header(Header{
+                        field: "Sec-Websocket-Protocol".parse().unwrap(),
+                        value: AsciiString::from_ascii(protocol).unwrap(),
+                    });
+            }
+        }
+        let key = request_key(&request)?; 
+        let key = convert_key(&key);
+        upgrade
+            .add_header(Header{
+                field: "Sec-Websocket-Accept".parse().unwrap(),
+                value: AsciiString::from_ascii(key).unwrap(),
+            });
+        let socket = request.upgrade("websocket", upgrade);
+        Ok(Websocket {
+            socket: socket,
+        })
 	}
 	
 	/// Read message from the websocket stream, 
