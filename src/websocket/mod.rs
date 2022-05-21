@@ -270,6 +270,53 @@ impl Websocket {
 			frame,
 		})
 	}
+    /// Send text data through websocket
+    pub fn send_text (&mut self, data: &str) -> std::io::Result<()> {
+        self.send_message(Message{
+            fin: true,
+            frame: WebsocketFrame::Text(data.to_string())
+        })
+    }
+
+    /// Send given message through websocket
+    pub fn send_message (&mut self, msg: Message) -> std::io::Result<()> {
+        let mut buf = [0; 256];
+        if msg.fin {
+            buf[0] = 0x80;
+        }
+        let iter = match msg.frame {
+            WebsocketFrame::Text(data) => {
+                buf[0] |= TEXT_OPCODE;
+                buf[1] |= data.len() as u8;
+                let mut offset = 2;
+                for b in data.as_str().bytes() {
+                    buf[offset] = b;
+                    offset += 1;
+                }
+            },
+            WebsocketFrame::Binary(data) => {
+                buf[0] |= BINARY_OPCODE;
+                buf[1] |= data.len() as u8;
+                for i in 0..data.len() {
+                    buf[i] = data[i]
+                }
+            },
+            WebsocketFrame::CloseRequest => {
+                buf[0] |= CLOSE_OPCODE;
+                buf[1] = 0;
+            },
+            WebsocketFrame::Ping => {
+                buf[0] |= PING_OPCODE;
+                buf[1] = 0;
+            },
+            WebsocketFrame::Pong => {
+                buf[0] |= PONG_OPCODE;
+                buf[1] = 0;
+            },
+        };
+        self.socket.write_all(&buf)?;
+        self.socket.flush()
+    }
 }
 
 /// Returns true if given HTTP request header contains special attributes
@@ -359,27 +406,6 @@ fn convert_key (input: &str) -> String {
 	sha1.update(input.as_bytes());
 	sha1.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
 	base64::encode_config(&sha1.digest().bytes(), base64::STANDARD)
-}
-
-/// Sends given data as a valid Websocket Frame
-fn send_data<W: Write> (data: &[u8], opcode: u8, mut stream: W) -> std::io::Result<()> {
-	let opcode = 0x80 | opcode;
-	// frame opcode
-	stream.write_all(&[opcode])?;
-	// frame length
-	stream.write_all(&[data.len() as u8])?;
-	//stream.write_all(&[127u8])?; // MAX
-	stream.write_all(data)?;
-	stream.flush()?;
-	Ok(())
-}
-
-pub fn send_binary<W: Write> (data: &[u8], mut stream: W) -> std::io::Result<()> {
-	send_data(data, 0x02, &mut stream)
-}
-
-pub fn send_text<W: Write> (data: &str, mut stream: W) -> std::io::Result<()> {
-	send_data(data.as_bytes(), 0x01, &mut stream)
 }
 
 #[cfg(test)]
