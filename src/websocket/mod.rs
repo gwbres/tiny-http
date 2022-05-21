@@ -10,7 +10,9 @@ use crate::{Request, Header, Response, StatusCode, ReadWrite};
 
 const SUPPORTED_REVISION : u16 = 13;
 
-/// Describes websocket connection attempts error
+/// Describes possible error when receiving a
+/// websocket connection attempt or trying to
+/// deploy the dedicated I/O stream
 #[derive(Error, Debug)]
 pub enum WebsocketError {
 	#[error("invalid websocket request")]
@@ -33,6 +35,8 @@ pub enum WebsocketError {
 	MissingKeyField,
 	#[error("missing `protocol` field")]
 	MissingProtocolField,
+    #[error("data from client is not masked")]
+    DataIsNotMasked,
 }
 
 /// Websocket handler
@@ -50,24 +54,25 @@ const PONG_OPCODE 			: u8 = 0x0A;
 /// Known Websocket frames 
 #[derive(Debug)]
 pub enum WebsocketFrame {
-	/// Text Message
+	/// Readable text data
 	Text(String),
-	/// Binary Data
+	/// Binary data
 	Binary(Vec<u8>),
-	/// Close() request
+	/// Client requested stream to be closed
 	CloseRequest,
-	/// Ping request
+	/// Client sent a `Ping` (keep alive) request 
 	Ping,
-	/// Pong answer
+	/// `Pong` is anwser to `Ping` request 
 	Pong,
 }
 
 /// Websocket message 
 #[derive(Debug)]
 pub struct Message {
-	/// FIN bit 
+	/// FIN bit indicates this message
+    /// terminates successive frames
 	pub fin: bool,
-	/// content 
+	/// content : actual data 
 	pub frame: WebsocketFrame,
 }
 
@@ -110,9 +115,9 @@ fn read_bigendian_u64<'a, T: Iterator<Item = &'a u8>>(input: &mut T) -> u64 {
 impl Websocket {
 	/// Deploys a new websocket handler (Rd/Wr stream) ready to use,
 	/// from a valid HTTP(s) request. 
-	/// Given request should match HTTP header requirements (refer to Doc.).   
-	/// request: HTTP websocket openning request   
-	/// protocol: optionnal (custom) protocol to declare   
+	/// Request should match HTTP header requirements (refer to doc).   
+	/// request: received from client
+	/// protocol: optionnal (custom sub-) protocol to declare   
 	/// If Err() (unmet header requirements),
 	/// it is best pratice to respond with a 404 error
 	pub fn new (request: Request, protocol: Option<&str>) -> Result<Websocket, WebsocketError> {
@@ -154,47 +159,71 @@ impl Websocket {
 		}
 	}
 	
-	/// Blocking websocket raw data receiver
+	/// Read message from the websocket stream, 
+    /// blocking call
 	pub fn recv (&mut self) -> std::io::Result<Message> {
 		let mut buf : Vec<u8> = Vec::with_capacity(256);
-		// 1) read at least 6 bytes 
-		//    otherwise, cant create a valid header
-		if self.socket.as_mut().take(6).read_to_end(&mut buf).is_err() {
+		if self.socket
+            .as_mut()
+            .take(2).
+            read_to_end(&mut buf).is_err() 
+        {
 			// not enough bytes
-			return Err(Error::new(ErrorKind::UnexpectedEof, "not even 6 bytes to read()"));
+			return Err(Error::new(ErrorKind::UnexpectedEof, "read first two bytes failed"));
 		}
 
-		// opcode
 		if buf[0] & 0x70 != 0 {
 			return Err(Error::new(ErrorKind::Other, "reserved bits (in opcode) must be zero"))
 		}
 		
 		let fin = (buf[0] & 0x80) != 0;
 		let opcode = buf[0] & 0x0F;
-		if buf[1] & 0x80 == 0 {
+
+        let mask = buf[1] & 0x80;
+        if mask == 0 {
 			return Err(Error::new(ErrorKind::Other, "Client to server messages must be masked"))
 		}
-		
-		// find frame length & identify data mask
-		let (length, mask) = match buf[1] & 0x7F {
-			126 => {
-				println!("126!");
-				let length = read_bigendian_u16(&mut buf.iter().skip(2));
-				(length as u64, 0)
-			},
-			127 => {
-				println!("127!");
-				let length = read_bigendian_u16(&mut buf.iter().skip(2));
-				(length as u64, 0)
-			},
-			n => {
-				println!("{}!",n);
-				(u64::from(n),read_bigendian_u32(&mut buf.iter().skip(2)))
-			},
-		};
-		
-		println!("Size: {}", length);
 
+        let payload_len = buf[1] & 0x7F;
+        let length = match payload_len {
+            126 => {
+                // the following two bytes interprated as uint16_t
+                if self.socket
+                    .as_mut()
+                    .take(2)
+                    .read_to_end(&mut buf).is_err()
+                {
+        			// not enough bytes
+			        return Err(Error::new(ErrorKind::UnexpectedEof, "read 2 bytes failed"))
+                }
+				read_bigendian_u16(&mut buf.iter()) as u64
+            },
+            127 => {
+                // the following eight bytes interprated as uint16_t
+                if self.socket
+                    .as_mut()
+                    .take(8)
+                    .read_to_end(&mut buf).is_err() {
+        			// not enough bytes
+			        return Err(Error::new(ErrorKind::UnexpectedEof, "read 8 bytes failed"))
+                }
+				read_bigendian_u64(&mut buf.iter())
+            },
+            _ => payload_len as u64
+        };
+        println!("Payload length: {}", length);
+
+        // read mask bits
+        if self.socket
+            .as_mut()
+            .take(4)
+            .read_to_end(&mut buf).is_err() {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "failed to read mask bits"))
+        }
+        let mask = read_bigendian_u32(&mut buf.iter().skip(2));
+        buf.clear();
+        println!("Masking Key: {:x}", mask);
+		
 		// grab raw data if needed
 		let mut data : Option<Vec<u8>> = match opcode {
 			BINARY_OPCODE | TEXT_OPCODE => {
@@ -204,8 +233,9 @@ impl Websocket {
 					.read_to_end(&mut buf);
 				let mut data : Vec<u8> = Vec::with_capacity(length as usize);
 				let mut offset : usize = 0;
+                // apply binary mask to later interprate correctly
 				for i in 0..length as usize {
-					let m = ((mask >> ((3-offset)*8)) & 0xFF) as u8;
+                    let m = ((mask >> ((3-offset)*8)) & 0xff)  as u8;
 					data.push(buf[i] ^ m);
 					offset = (offset +1) %4;
 				}
@@ -213,7 +243,6 @@ impl Websocket {
 			},
 			_ => None,
 		};
-		println!("RAW DATA {:#?}", data.as_ref().unwrap());
 
 		let frame = match opcode {
 			CONTINUATION_OPCODE => {
@@ -302,7 +331,7 @@ fn request_key (request: &Request) -> Result<String, WebsocketError> {
 
 /// Returns true if given HTTP request matches 
 /// a request to open a websocket
-fn is_websocket_request (request: &Request) -> Result<bool, WebsocketError> {
+pub fn is_websocket_request (request: &Request) -> Result<bool, WebsocketError> {
 	Ok(is_connection_upgrade(request)?
 		&& is_websocket_upgrade(request)?
 		&& websocket_version_supported(request)?)
