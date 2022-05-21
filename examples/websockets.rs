@@ -21,6 +21,7 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
         socket.binaryType = \"arraybuffer\";
 
         function send_text(data) {{
+            console.log('sending ' + data);
             socket.send(data);
         }}
 
@@ -34,14 +35,26 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
             socket.send(data);
         }}
 
+        function terminate(code = null, reason = null) {{
+            console.log(\"closing ws on user request\");
+            if (code == null) {{
+                socket.close();
+            }} else {{
+                if (reason == null) {{
+                    socket.close(code);
+                }} else {{
+                    socket.close(code, reason);
+                }}
+            }}
+            socket = new WebSocket(\"ws://localhost:{0:}\", \"example\");
+        }}
+
         socket.onmessage = function(event) {{
             document.getElementById('response').value = event.data;
         }}
 
         socket.onclose = function() {{
-            console.log(\"socket was closed, openning a new one\");
-            // re-establish connexion
-            socket = new WebSocket(\"ws://localhost:{0:}/\", \"example\");
+            console.log(\"socket was closed\");
         }}
 
         var failure = function() {{
@@ -54,7 +67,7 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
 
         </script>
         <h2>Websocket duplex channel example</h2>
-        <p>Use this entry to send String / UTF8 readable data to the server </p>
+        <p>Use this entry to send UTF-8 encoded data (readable string) to the server </p>
         <p>
             <input type=\"text\" id=\"send_text\" />
             <button onclick=\"send_text(document.getElementById('send_text').value)\">Send</button>
@@ -67,6 +80,30 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
         </p>
 
         <p>Server is saying : <input type=\"text\" id=\"response\"/></p>
+
+        <br>
+        <p>Click one of those to terminate websocket connexion smoothly (on user request).</p>
+        <p>    Channel is destroyed on user command and we create a new one right away so you
+        can continue using this page.</p>
+        <p><button onclick=\"terminate(null, null)\">Terminate as is</button></p>
+        <p><button onclick=\"terminate(1000, null)\">Terminate with status code</button></p>
+        <p><button onclick=\"terminate(3000, 'because I want so')\">Explicit termination</button></p>
+        </p>
+
+        <p>Click <i><b>Send</b></i> to send the following paragraph.</p>
+        <p>Then click <i><b>Verify</b></i> to compare received content which must exactly match</p>
+        <p>
+            Content is too long to fit in a single frame and involves 
+            FIN bit interpretation and complex frame reconstruction.</p>
+
+        <p>
+            <input type=\"text\" id=\"paragraph1\" readonly=\"readonly\" value=\"Contrary to popular belief, Lorem Ipsum is not simply random text. It has roots in a piece of classical Latin literature from 45 BC, making it over 2000 years old.\" />
+        </p>
+
+        <p>
+            <button onclick=\"send_text(document.getElementById('paragraph1').value)\">Send</button>
+        </p>
+
     ",
         port
     ))
@@ -108,19 +145,38 @@ fn main() {
                                     websocket::Frame::Binary(data) => {
                                         println!("Received raw data {:#?}", data);
                                         let mut answer : String = String::from("You sent \"");
-                                        for byte in data {
-                                            answer.push_str(&format!("{}, ", byte));
+                                        for i in 0..data.len()-1 {
+                                            answer.push_str(&format!("{}, ", data[i]));
                                         }
+                                        answer.push_str(&format!("{}\"", data[data.len()-1]));
                                         ws.send_text(&answer).unwrap();
                                     },
-                                    websocket::Frame::Close => {
-                                        println!("Client requested ws termination");
-                                        //request.respond(error_404());
+                                    websocket::Frame::Close(None, None) => {
+                                        println!("Client requested ws termination without much explanations");
                                         ws.send_message(websocket::Message{
                                             fin: true,
-                                            frame: websocket::Frame::Close,
+                                            frame: websocket::Frame::Close(None,None),
                                         }).unwrap();
-                                        println!("close channel");
+                                        println!("closed websocket");
+                                        break // terminates websocket
+                                    },
+                                    websocket::Frame::Close(Some(code), None) => {
+                                        println!("Client requested ws termination with code {}", code);
+                                        ws.send_message(websocket::Message{
+                                            fin: true,
+                                            frame: websocket::Frame::Close(None,None),
+                                        }).unwrap();
+                                        println!("closed websocket");
+                                        break // terminates websocket
+                                    }
+                                    websocket::Frame::Close(Some(code),Some(reason)) => {
+                                        println!("Client requested ws termination with code {}", code);
+                                        println!("For the following reason: \"{}\"", reason);
+                                        ws.send_message(websocket::Message{
+                                            fin: true,
+                                            frame: websocket::Frame::Close(None,None),
+                                        }).unwrap();
+                                        println!("closed websocket");
                                         break // terminates websocket
                                     },
                                     websocket::Frame::Ping => {
@@ -133,6 +189,7 @@ fn main() {
                                     websocket::Frame::Pong => {
                                         println!("Received a `pong` frame, which should never happen")
                                     },
+                                    _ => {}, // other unfeasible combinations
                                 }
                             } else {
                                 println!("failed to read websocket");

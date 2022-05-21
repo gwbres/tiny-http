@@ -59,7 +59,9 @@ pub enum Frame {
 	/// Binary data
 	Binary(Vec<u8>),
 	/// Socket close request / answer
-	Close,
+    /// (code,reason): closing code and possible description about
+    /// why we're closing this socket
+	Close(Option<u16>, Option<String>),
 	/// Client sent a `Ping` (keep alive) request 
 	Ping,
 	/// `Pong` is anwser to `Ping` request 
@@ -195,10 +197,10 @@ impl Websocket {
         			// not enough bytes
 			        return Err(Error::new(ErrorKind::UnexpectedEof, "read 2 bytes failed"))
                 }
-				read_bigendian_u16(&mut buf.iter()) as u64
+				payload_len as u64 + read_bigendian_u16(&mut buf.iter()) as u64
             },
             127 => {
-                // the following eight bytes interprated as uint16_t
+                // the following eight bytes interprated as uint64_t
                 if self.socket
                     .as_mut()
                     .take(8)
@@ -206,9 +208,11 @@ impl Websocket {
         			// not enough bytes
 			        return Err(Error::new(ErrorKind::UnexpectedEof, "read 8 bytes failed"))
                 }
-				read_bigendian_u64(&mut buf.iter())
+				payload_len as u64 + read_bigendian_u64(&mut buf.iter())
             },
-            _ => payload_len as u64
+            _ => {
+                payload_len as u64
+            },
         };
         println!("Payload length: {}", length);
 
@@ -240,6 +244,27 @@ impl Websocket {
 				}
 				Some(data)
 			},
+            CLOSE => {
+                if length > 1 { // got at least a termination code
+                    // grab payload so we can parse termination code
+                    // and possible event description
+                    self.socket
+                        .as_mut()
+                        .take(length)
+                        .read_to_end(&mut buf);
+                    let mut data : Vec<u8> = Vec::with_capacity(length as usize);
+                    let mut offset : usize = 0;
+                    // apply binary mask to later interprate correctly
+                    for i in 0..length as usize {
+                        let m = ((mask >> ((3-offset)*8)) & 0xff)  as u8;
+                        data.push(buf[i] ^ m);
+                        offset = (offset +1) %4;
+                    }
+                    Some(data)
+                } else {
+                    None
+                }
+            }
 			_ => None,
 		};
 
@@ -255,7 +280,23 @@ impl Websocket {
 					panic!("text decoding failure")
 				}
 			},
-			CLOSE_OPCODE => Frame::Close,
+			CLOSE_OPCODE => {
+                let mut code: Option<u16> = None;
+                let mut desc: Option<String> = None;
+                if let Some(data) = data { // got something to parse
+                    if length == 2 {
+                        // only got a status code
+                        code = Some(read_bigendian_u16(&mut data.iter()))
+                    } else {
+                        // got status code + event description
+                        code = Some(read_bigendian_u16(&mut data.iter()));
+                        if let Ok(content) = std::str::from_utf8(&data[2..]) {
+                            desc = Some(content.to_string())
+                        }
+                    }
+                }
+                Frame::Close(code,desc)
+            },
 			PING_OPCODE => Frame::Ping,
 			PONG_OPCODE => {
 				panic!("received unexpected pong answer")
@@ -300,7 +341,7 @@ impl Websocket {
                     buf.push(data[i])
                 }
             },
-            Frame::Close => {
+            Frame::Close(_,_) => {
                 b0 |= CLOSE_OPCODE;
             },
             Frame::Ping => {
