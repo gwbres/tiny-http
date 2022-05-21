@@ -114,7 +114,6 @@ pub use common::{HTTPVersion, Header, HeaderField, Method, StatusCode};
 pub use connection::{ConfigListenAddr, ListenAddr, Listener};
 pub use request::{ReadWrite, Request};
 pub use response::{Response, ResponseBox};
-pub use websocket::{Websocket, WebsocketFrame};
 pub use test::TestRequest;
 
 mod client;
@@ -125,7 +124,7 @@ mod response;
 mod ssl;
 mod test;
 mod util;
-mod websocket;
+pub mod websocket;
 
 /// The main class of this library.
 ///
