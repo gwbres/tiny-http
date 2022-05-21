@@ -16,7 +16,21 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
         <script type=\"text/javascript\">
         var socket = new WebSocket(\"ws://localhost:{0:}/\", \"example\");
 
-        function send(data) {{
+        // we use `bytearray` for convenience,
+        // when sending binary data to the server
+        socket.binaryType = \"arraybuffer\";
+
+        function send_text(data) {{
+            socket.send(data);
+        }}
+
+        function send_binary(data) {{
+            var bytes = []; // char codes
+            for (var i =0; i < data.length; ++i) {{
+                var byte = data.charCodeAt(i);
+                bytes = bytes.concat([byte])
+            }}
+            var data = new Uint8Array(bytes);
             socket.send(data);
         }}
 
@@ -40,10 +54,16 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
 
         </script>
         <h2>Websocket duplex channel example</h2>
-        <p>Use the text entry to enter text directly, server will read it and send it back</p>
+        <p>Use this entry to send String / UTF8 readable data to the server </p>
         <p>
             <input type=\"text\" id=\"send_text\" />
-            <button onclick=\"send(document.getElementById('send_text').value)\">Send</button>
+            <button onclick=\"send_text(document.getElementById('send_text').value)\">Send</button>
+        </p>
+        
+        <p>Use this entry to send raw / binary data</p>
+        <p>
+            <input type=\"text\" id=\"send_binary\" />
+            <button onclick=\"send_binary(document.getElementById('send_binary').value)\">Send</button>
         </p>
 
         <p>Server is saying : <input type=\"text\" id=\"response\"/></p>
@@ -86,7 +106,12 @@ fn main() {
                                         ws.send_text(&format!("You sent \"{}\"", data)).unwrap();
                                     },
                                     websocket::Frame::Binary(data) => {
-                                        println!("Received raw data {:#?}", data)
+                                        println!("Received raw data {:#?}", data);
+                                        let mut answer : String = String::from("You sent \"");
+                                        for byte in data {
+                                            answer.push_str(&format!("{}, ", byte));
+                                        }
+                                        ws.send_text(&answer).unwrap();
                                     },
                                     websocket::Frame::Close => {
                                         println!("Client requested ws termination");
