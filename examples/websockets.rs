@@ -5,31 +5,48 @@ extern crate tiny_http;
 use std::io::Cursor;
 use std::thread::spawn;
 
+use tiny_http::{Response, StatusCode};
+use tiny_http::websocket;
+use tiny_http::websocket::Websocket;
 use tiny_http::websocket::is_websocket_request;
-use tiny_http::websocket::{Websocket, WebsocketFrame};
-
-use rustc_serialize::base64::{Config, Newline, Standard, ToBase64};
 
 fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
     tiny_http::Response::from_string(format!(
         "
         <script type=\"text/javascript\">
-        var socket = new WebSocket(\"ws://localhost:{}/\", \"example\");
+        var socket = new WebSocket(\"ws://localhost:{0:}/\", \"example\");
 
         function send(data) {{
             socket.send(data);
         }}
 
         socket.onmessage = function(event) {{
-            document.getElementById('result').innerHTML += event.data + '<br />';
+            document.getElementById('response').value = event.data;
         }}
+
+        socket.onclose = function() {{
+            console.log(\"socket was closed, openning a new one\");
+            // re-establish connexion
+            socket = new WebSocket(\"ws://localhost:{0:}/\", \"example\");
+        }}
+
+        var failure = function() {{
+            console.log(\"failure should never happen\");
+            console.log(\"server did not respond correctly at some point\");
+        }}
+
+        socket.onerror = failure;
+        socket.onfailure = failure;
+
         </script>
-        <p>This example will receive &quot;Hello&quot; for each byte in the packet being sent.
-        Tiny-http doesn't support decoding websocket frames, so we can't do anything better.</p>
-        <p><input type=\"text\" id=\"msg\" />
-        <button onclick=\"send(document.getElementById('msg').value)\">Send</button></p>
-        <p>Received: </p>
-        <p id=\"result\"></p>
+        <h2>Websocket duplex channel example</h2>
+        <p>Use the text entry to enter text directly, server will read it and send it back</p>
+        <p>
+            <input type=\"text\" id=\"send_text\" />
+            <button onclick=\"send(document.getElementById('send_text').value)\">Send</button>
+        </p>
+
+        <p>Server is saying : <input type=\"text\" id=\"response\"/></p>
     ",
         port
     ))
@@ -40,27 +57,8 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// Turns a Sec-WebSocket-Key into a Sec-WebSocket-Accept.
-/// Feel free to copy-paste this function, but please use a better error handling.
-fn convert_key(input: &str) -> String {
-    use sha1::Sha1;
-
-    let mut input = input.to_string().into_bytes();
-    let mut bytes = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-        .to_string()
-        .into_bytes();
-    input.append(&mut bytes);
-
-    let mut sha1 = Sha1::new();
-    sha1.update(&input);
-
-    sha1.digest().bytes().to_base64(Config {
-        char_set: Standard,
-        pad: true,
-        line_length: None,
-        newline: Newline::LF,
-    })
-}
+fn error_code(code: u16) -> Response<std::io::Empty> { Response::empty(StatusCode(code)) }
+fn error_404() -> Response<std::io::Empty> { error_code(404) }
 
 fn main() {
     let server = tiny_http::Server::http("0.0.0.0:1234").unwrap();
@@ -83,28 +81,38 @@ fn main() {
                         loop {
                             if let Ok(msg) = ws.recv() {
                                 match msg.frame {
-                                    WebsocketFrame::Text(data) => {
+                                    websocket::Frame::Text(data) => {
                                         println!("Received text data {:#?}", data);
                                         ws.send_text(&format!("You sent \"{}\"", data)).unwrap();
                                     },
-                                    WebsocketFrame::Binary(data) => {
+                                    websocket::Frame::Binary(data) => {
                                         println!("Received raw data {:#?}", data)
                                     },
-                                    WebsocketFrame::CloseRequest => {
-                                        println!("Receive stream close() request");
-                                        println!("websocket smooth termination");
+                                    websocket::Frame::Close => {
+                                        println!("Client requested ws termination");
+                                        //request.respond(error_404());
+                                        ws.send_message(websocket::Message{
+                                            fin: true,
+                                            frame: websocket::Frame::Close,
+                                        }).unwrap();
+                                        println!("close channel");
+                                        break // terminates websocket
                                     },
-                                    WebsocketFrame::Ping => {
-                                        println!("Received `ping` request")
+                                    websocket::Frame::Ping => {
+                                        println!("Received `ping` request");
+                                        ws.send_message(websocket::Message{
+                                            fin: true,
+                                            frame: websocket::Frame::Pong,
+                                        }).unwrap()
                                     },
-                                    WebsocketFrame::Pong => {
-                                        println!("Received unexpected pong() answer")
+                                    websocket::Frame::Pong => {
+                                        println!("Received a `pong` frame, which should never happen")
                                     },
                                 }
                             } else {
                                 println!("failed to read websocket");
                                 println!("websocket termination");
-                                break // terminate websocket
+                                break // terminates websocket
                             }
                         }
                     });

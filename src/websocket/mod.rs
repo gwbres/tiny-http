@@ -53,13 +53,13 @@ const PONG_OPCODE 			: u8 = 0x0A;
 
 /// Known Websocket frames 
 #[derive(Debug)]
-pub enum WebsocketFrame {
+pub enum Frame {
 	/// Readable text data
 	Text(String),
 	/// Binary data
 	Binary(Vec<u8>),
-	/// Client requested stream to be closed
-	CloseRequest,
+	/// Socket close request / answer
+	Close,
 	/// Client sent a `Ping` (keep alive) request 
 	Ping,
 	/// `Pong` is anwser to `Ping` request 
@@ -73,11 +73,11 @@ pub struct Message {
     /// terminates successive frames
 	pub fin: bool,
 	/// content : actual data 
-	pub frame: WebsocketFrame,
+	pub frame: Frame,
 }
 
-impl Default for WebsocketFrame {
-	fn default() -> WebsocketFrame { WebsocketFrame::Pong }
+impl Default for Frame {
+	fn default() -> Frame { Frame::Pong }
 }
 
 fn read_bigendian_u16<'a, T: Iterator<Item = &'a u8>>(input: &mut T) -> u16 {
@@ -127,12 +127,15 @@ impl Websocket {
                 value: AsciiString::from_ascii("SID=abcdefg; Max-Age=3600; Path=/; HttpOnly").unwrap(),
             });
         if let Some(protocol) = protocol {
-            // add possible desired custom protocol
+            // add possible desired custom/sub protocol
             if let Some(protocols) = request_protocols(&request) {
                 upgrade
                     .add_header(Header{
                         field: "Sec-Websocket-Protocol".parse().unwrap(),
-                        value: AsciiString::from_ascii(format!("{}", protocol)).unwrap(), //TODO retrieve all previous protocols please
+                        //value: AsciiString::from_ascii(format!("{}, {}", // apppend protocol to existing ones
+                        value: AsciiString::from_ascii(format!("{}", // apppend protocol to existing ones
+                            protocol)).unwrap(),
+                            //protocols.join(","))).unwrap(),
                     });
             } else {
                 upgrade
@@ -155,8 +158,8 @@ impl Websocket {
         })
 	}
 	
-	/// Read message from the websocket stream, 
-    /// blocking call
+	/// Read message from the websocket stream,
+    /// using a blocking call
 	pub fn recv (&mut self) -> std::io::Result<Message> {
 		let mut buf : Vec<u8> = Vec::with_capacity(256);
 		if self.socket
@@ -244,16 +247,16 @@ impl Websocket {
 			CONTINUATION_OPCODE => {
 				panic!("unable to handle continuation opcodes @ the moment")
 			},
-			BINARY_OPCODE => WebsocketFrame::Binary(data.unwrap()),
+			BINARY_OPCODE => Frame::Binary(data.unwrap()),
 			TEXT_OPCODE => { 
 				if let Ok(content) = std::str::from_utf8(&data.unwrap()) {
-					WebsocketFrame::Text(content.to_string())
+					Frame::Text(content.to_string())
 				} else {
 					panic!("text decoding failure")
 				}
 			},
-			CLOSE_OPCODE => WebsocketFrame::CloseRequest,
-			PING_OPCODE => WebsocketFrame::Ping,
+			CLOSE_OPCODE => Frame::Close,
+			PING_OPCODE => Frame::Ping,
 			PONG_OPCODE => {
 				panic!("received unexpected pong answer")
 			},
@@ -270,46 +273,45 @@ impl Websocket {
     pub fn send_text (&mut self, data: &str) -> std::io::Result<()> {
         self.send_message(Message{
             fin: true,
-            frame: WebsocketFrame::Text(data.to_string())
+            frame: Frame::Text(data.to_string())
         })
     }
 
     /// Send given message through websocket
     pub fn send_message (&mut self, msg: Message) -> std::io::Result<()> {
-        let mut buf = [0; 256];
+        let mut buf : Vec<u8> = Vec::with_capacity(256);
+        let mut b0 = 0x00;
+        let mut b1 = 0x00;
         if msg.fin {
-            buf[0] = 0x80;
+            b0 |= 0x80; // FIN bit
         }
         let iter = match msg.frame {
-            WebsocketFrame::Text(data) => {
-                buf[0] |= TEXT_OPCODE;
-                buf[1] |= data.len() as u8;
-                let mut offset = 2;
+            Frame::Text(data) => {
+                b0 |= TEXT_OPCODE;
+                b1 |= data.len() as u8;
                 for b in data.as_str().bytes() {
-                    buf[offset] = b;
-                    offset += 1;
+                    buf.push(b);
                 }
             },
-            WebsocketFrame::Binary(data) => {
-                buf[0] |= BINARY_OPCODE;
-                buf[1] |= data.len() as u8;
+            Frame::Binary(data) => {
+                b0 |= TEXT_OPCODE;
+                b1 |= data.len() as u8;
                 for i in 0..data.len() {
-                    buf[i] = data[i]
+                    buf.push(data[i])
                 }
             },
-            WebsocketFrame::CloseRequest => {
-                buf[0] |= CLOSE_OPCODE;
-                buf[1] = 0;
+            Frame::Close => {
+                b0 |= CLOSE_OPCODE;
             },
-            WebsocketFrame::Ping => {
-                buf[0] |= PING_OPCODE;
-                buf[1] = 0;
+            Frame::Ping => {
+                b0 |= PING_OPCODE;
             },
-            WebsocketFrame::Pong => {
-                buf[0] |= PONG_OPCODE;
-                buf[1] = 0;
+            Frame::Pong => {
+                b0 |= PONG_OPCODE;
             },
         };
+        buf.insert(0,b1);
+        buf.insert(0,b0);
         self.socket.write_all(&buf)?;
         self.socket.flush()
     }
