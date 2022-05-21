@@ -36,7 +36,6 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
         }}
 
         function terminate(code = null, reason = null) {{
-            console.log(\"closing ws on user request\");
             if (code == null) {{
                 socket.close();
             }} else {{
@@ -90,6 +89,14 @@ fn home_page(port: u16) -> tiny_http::Response<Cursor<Vec<u8>>> {
         <p><button onclick=\"terminate(3000, 'because I want so')\">Explicit termination</button></p>
         </p>
 
+        <br>
+        <p>Click 
+        <button onclick=\"send_text('Ping')\">Ping</button>
+        to have the server send a <i><b>Ping</b></i> to the client,
+        to which <i><b>Javascript</b></i> automatically answers. 
+        See server log for testbench result. </p>
+
+        <br>
         <p>Click <i><b>Send</b></i> to send the following paragraph.</p>
         <p>Then click <i><b>Verify</b></i> to compare received content which must exactly match</p>
         <p>
@@ -139,8 +146,14 @@ fn main() {
                             if let Ok(msg) = ws.recv() {
                                 match msg.frame {
                                     websocket::Frame::Text(data) => {
-                                        println!("Received text data {:#?}", data);
-                                        ws.send_text(&format!("You sent \"{}\"", data)).unwrap();
+                                        if data.eq("Ping") {
+                                            // special request from the client
+                                            // Ping ---> Pong desmonstration
+                                            ws.ping("Are you There?").unwrap()
+                                        } else {
+                                            println!("Received text data {:#?}", data);
+                                            ws.send_text(&format!("You sent \"{}\"", data)).unwrap();
+                                        }
                                     },
                                     websocket::Frame::Binary(data) => {
                                         println!("Received raw data {:#?}", data);
@@ -179,15 +192,10 @@ fn main() {
                                         println!("closed websocket");
                                         break // terminates websocket
                                     },
-                                    websocket::Frame::Ping => {
-                                        println!("Received `ping` request");
-                                        ws.send_message(websocket::Message{
-                                            fin: true,
-                                            frame: websocket::Frame::Pong,
-                                        }).unwrap()
-                                    },
-                                    websocket::Frame::Pong => {
-                                        println!("Received a `pong` frame, which should never happen")
+                                    websocket::Frame::Pong(msg) => {
+                                        println!("Server received a pong");
+                                        assert!(msg.unwrap().eq("Are you There?"));
+                                        println!("Ping / Pong test bench validated!");
                                     },
                                     _ => {}, // other unfeasible combinations
                                 }

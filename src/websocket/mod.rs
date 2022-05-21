@@ -12,7 +12,7 @@ const SUPPORTED_REVISION : u16 = 13;
 
 /// Describes possible error when receiving a
 /// websocket connection attempt or trying to
-/// deploy the dedicated I/O stream
+/// deploy the dedicated websocket stream 
 #[derive(Error, Debug)]
 pub enum WebsocketError {
 	#[error("invalid websocket request")]
@@ -62,10 +62,12 @@ pub enum Frame {
     /// (code,reason): closing code and possible description about
     /// why we're closing this socket
 	Close(Option<u16>, Option<String>),
-	/// Client sent a `Ping` (keep alive) request 
-	Ping,
-	/// `Pong` is anwser to `Ping` request 
-	Pong,
+    /// `Ping` message with optionnal payload
+	Ping(Option<String>),
+	/// `Pong`: client answering a `Ping`,
+    /// client should always copy both http header and ping message
+    /// to complete a ping / pong exchange
+	Pong(Option<String>),
 }
 
 /// Websocket message 
@@ -79,7 +81,7 @@ pub struct Message {
 }
 
 impl Default for Frame {
-	fn default() -> Frame { Frame::Pong }
+	fn default() -> Frame { Frame::Ping(None) }
 }
 
 fn read_bigendian_u16<'a, T: Iterator<Item = &'a u8>>(input: &mut T) -> u16 {
@@ -115,30 +117,40 @@ fn read_bigendian_u64<'a, T: Iterator<Item = &'a u8>>(input: &mut T) -> u64 {
 }
 
 impl Websocket {
-	/// Deploys a new websocket handler (Rd/Wr stream) ready to use,
-	/// from a valid HTTP(s) request. 
-	/// Request should match HTTP header requirements (refer to doc).   
-	/// request: received from client
-	/// protocol: optionnal (custom sub-) protocol to declare   
-	/// If Err() (unmet header requirements),
-	/// it is best pratice to respond with a 404 error
+	/// Deploys a new websocket channel, from a valid HTTP(s) websocket request.  
+    /// This structure can receive and transmit one frame at a time.
+	/// request: incoming HTTP(s) request, must match header requirements:
+    ///    + has connection upgrade field
+    ///    + has websocket upgrade field
+    ///    + websocket "version" matches websocket::SUPPORTED_REVISION
+	/// protocol: optionnal (sub) protocol to declare   
 	pub fn new (request: Request, protocol: Option<&str>) -> Result<Websocket, WebsocketError> {
-        let mut upgrade = Response::empty(StatusCode(101)) // `switching` protocol
-            .with_header(Header {
+        let mut upgrade = Response::empty(StatusCode(101)); // `switching` protocol
+            /*.with_header(Header {
                 field: "Set-Cookie".parse().unwrap(),
                 value: AsciiString::from_ascii("SID=abcdefg; Max-Age=3600; Path=/; HttpOnly").unwrap(),
-            });
+            });*/
         if let Some(protocol) = protocol {
             // add possible desired custom/sub protocol
             if let Some(protocols) = request_protocols(&request) {
                 upgrade
                     .add_header(Header{
                         field: "Sec-Websocket-Protocol".parse().unwrap(),
-                        //value: AsciiString::from_ascii(format!("{}, {}", // apppend protocol to existing ones
-                        value: AsciiString::from_ascii(format!("{}", // apppend protocol to existing ones
-                            protocol)).unwrap(),
-                            //protocols.join(","))).unwrap(),
+                        value: AsciiString::from_ascii(protocol).unwrap(),
                     });
+                /*if !protocols.contains(&protocol.to_string()) {
+                    let content = format!("{}, {}",
+                        protocol,
+                        protocols.join(",")); // put protocols toghether
+                    println!("DEBUG: {}", content);
+                    upgrade
+                        .add_header(Header{
+                            field: "Sec-Websocket-Protocol".parse().unwrap(),
+                            value: AsciiString::from_ascii(content).unwrap(),
+                        });
+                } else {
+                    println!("Already existing")
+                }*/
             } else {
                 upgrade
                     .add_header(Header{
@@ -159,9 +171,8 @@ impl Websocket {
             socket: socket,
         })
 	}
-	
-	/// Read message from the websocket stream,
-    /// using a blocking call
+	/// Reads one complete frame from the websocket stream,
+    /// this call is blocking
 	pub fn recv (&mut self) -> std::io::Result<Message> {
 		let mut buf : Vec<u8> = Vec::with_capacity(256);
 		if self.socket
@@ -244,7 +255,7 @@ impl Websocket {
 				}
 				Some(data)
 			},
-            CLOSE => {
+            CLOSE_OPCODE | PONG_OPCODE => {
                 if length > 1 { // got at least a termination code
                     // grab payload so we can parse termination code
                     // and possible event description
@@ -297,13 +308,17 @@ impl Websocket {
                 }
                 Frame::Close(code,desc)
             },
-			PING_OPCODE => Frame::Ping,
+			PING_OPCODE => panic!("Unexpected ping opcode: client must not initiate a ping request"),
 			PONG_OPCODE => {
-				panic!("received unexpected pong answer")
+                let mut desc : Option<String> = None;
+                if length > 0 {
+                    if let Ok(content) = std::str::from_utf8(&data.unwrap()) {
+                        desc = Some(content.to_string())
+                    }
+                }
+                Frame::Pong(desc)
 			},
-			_ => {
-				panic!("received unknown opcode {}", opcode)
-			}
+            _ => panic!("received non supported opcode")
 		};
 		Ok(Message{
 			fin,
@@ -317,8 +332,16 @@ impl Websocket {
             frame: Frame::Text(data.to_string())
         })
     }
-
-    /// Send given message through websocket
+    /// `Ping` the client with given message payload
+    pub fn ping (&mut self, msg: &str) -> std::io::Result<()> {
+        self.send_message(Message {
+            fin: true,
+            frame: Frame::Ping(Some(msg.to_string()))
+        })
+    }
+    /// Send given message through websocket.
+    /// It is possible to send all supported Frames but `Pong` 
+    /// which is reserved to the client side
     pub fn send_message (&mut self, msg: Message) -> std::io::Result<()> {
         let mut buf : Vec<u8> = Vec::with_capacity(256);
         let mut b0 = 0x00;
@@ -344,11 +367,17 @@ impl Websocket {
             Frame::Close(_,_) => {
                 b0 |= CLOSE_OPCODE;
             },
-            Frame::Ping => {
+            Frame::Ping(data) => {
                 b0 |= PING_OPCODE;
+                if let Some(data) = data { // verbose ping
+                    b1 |= data.len() as u8;
+                    for b in data.as_str().bytes() {
+                        buf.push(b);
+                    }
+                }
             },
-            Frame::Pong => {
-                b0 |= PONG_OPCODE;
+            _ => {
+                panic!("sending a `pong` is not feasible")
             },
         };
         buf.insert(0,b1);
